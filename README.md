@@ -1,4 +1,6 @@
-# CS329Z Assignment 1: Building an Agentic Harness
+![Agent Harness: CS329Z Assignment 1](assets/agent-harness.png)
+
+# CS329Z Assignment 1: Building an Agent Harness
 
 This is the starter repository for Assignment 1.
 
