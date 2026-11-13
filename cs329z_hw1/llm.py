@@ -67,7 +67,7 @@ DEEPSEEK_URL = "https://api.deepseek.com"
 DEEPSEEK_MODELS = {
     "grading": "deepseek-flash",
     "user": "deepseek-flash",
-    "judge": "deepseek-v4-pro",
+    "judge": "deepseek-flash",  # CS329Z_JUDGE_MODEL=deepseek-v4-pro for the other model
 }
 PROVIDERS = ("openrouter", "deepseek")
 
