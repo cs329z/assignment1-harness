@@ -57,6 +57,20 @@ DEFAULT_MODELS = {
 # ("openai/gpt-6-luna"); https://openrouter.ai/models lists them.
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 
+# Local addition, not part of the course starter: DeepSeek as a second
+# provider, for working without an OpenRouter key. It is used when
+# CS329Z_PROVIDER=deepseek, or when CS329Z_PROVIDER is unset and
+# DEEPSEEK_API_KEY is set. Grading replaces this file and uses the models
+# above, so live-test results on DeepSeek are an approximation of the grade.
+# https://api-docs.deepseek.com lists the models.
+DEEPSEEK_URL = "https://api.deepseek.com"
+DEEPSEEK_MODELS = {
+    "grading": "deepseek-flash",
+    "user": "deepseek-flash",
+    "judge": "deepseek-v4-pro",
+}
+PROVIDERS = ("openrouter", "deepseek")
+
 # Reasoning effort requested from models that accept it (GPT-5 and GPT-6).
 # Override with CS329Z_REASONING_EFFORT.
 DEFAULT_REASONING_EFFORT = "low"
@@ -84,9 +98,19 @@ PRICES = {
     "gpt-5.5": (5.00, 0.50, 30.00),
     "gpt-6-luna": (0.10, 0.01, 0.50),
     "gpt-6-sol": (2.00, 0.20, 10.00),
+    # DeepSeek does not report a cost, so these are what the ledger uses.
+    # They are the peak-hour prices (off-peak is half), so the ledger is an
+    # upper bound. Read from https://api-docs.deepseek.com/quick_start/pricing
+    # on 2026-11-13.
+    "deepseek-flash": (0.30, 0.006, 1.20),
+    "deepseek-v4-pro": (1.32, 0.044, 3.96),
 }
 
 VALID_ROLES = ("system", "user", "assistant")
+
+# Finish reasons with which DeepSeek reports a reply it did not finish for a
+# reason of its own (not max_tokens). Such a reply is not returned or cached.
+_INTERRUPTED = ("insufficient_system_resource", "aborted")
 
 
 class BudgetExceeded(RuntimeError):
@@ -130,7 +154,23 @@ def resolve_model(role_or_model: str | None = None) -> str:
     """
     name = role_or_model or "grading"
     if name in DEFAULT_MODELS:
-        return os.environ.get(f"CS329Z_{name.upper()}_MODEL", DEFAULT_MODELS[name])
+        defaults = DEEPSEEK_MODELS if provider() == "deepseek" else DEFAULT_MODELS
+        return os.environ.get(f"CS329Z_{name.upper()}_MODEL", defaults[name])
+    return name
+
+
+def provider() -> str:
+    """Which API the calls go to: "openrouter" or "deepseek".
+
+    ``CS329Z_PROVIDER`` decides. Without it, DeepSeek is used if
+    ``DEEPSEEK_API_KEY`` is set, and OpenRouter otherwise.
+    """
+    _load_env()  # the keys are usually in .env
+    name = os.environ.get("CS329Z_PROVIDER", "").strip().lower()
+    if not name:
+        name = "deepseek" if os.environ.get("DEEPSEEK_API_KEY") else "openrouter"
+    if name not in PROVIDERS:
+        raise ValueError(f"CS329Z_PROVIDER must be one of {PROVIDERS}, got {name!r}")
     return name
 
 
@@ -221,7 +261,9 @@ class LM:
     ----------
     model:
         A role ("grading", "user", "judge"), an OpenRouter model name such
-        as "openai/gpt-6-sol", or ``None`` for "grading".
+        as "openai/gpt-6-sol" (a DeepSeek model name such as
+        "deepseek-v4-pro" when the provider is DeepSeek, see ``provider``),
+        or ``None`` for "grading".
     temperature, max_tokens:
         Sampling settings. They are part of the cache key. Reasoning models
         spend part of ``max_tokens`` on hidden reasoning, so keep it large.
@@ -262,6 +304,7 @@ class LM:
         self.cost_usd = 0.0
         self.seconds = 0.0
         self._client = None
+        self._provider = provider()
 
     # -- public API -------------------------------------------------------
 
@@ -308,6 +351,11 @@ class LM:
                 output_tokens=usage["output"],
                 reasoning_tokens=usage.get("reasoning", 0),
             )
+        if usage.get("finish_reason") in _INTERRUPTED:  # charged and logged, never cached
+            raise RuntimeError(
+                f"{self.model} did not finish its reply (finish_reason={usage['finish_reason']!r}): "
+                "the provider interrupted it. Run again."
+            )
         if self.cache and text.strip():  # an empty reply is not worth remembering
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
@@ -350,34 +398,36 @@ class LM:
             )
 
     def _complete(self, messages: list[Message]) -> tuple[str, dict]:
+        deepseek = self._provider == "deepseek"
         if self._client is None:
             from openai import OpenAI
 
-            key = os.environ.get("OPENROUTER_API_KEY")
+            key_name = "DEEPSEEK_API_KEY" if deepseek else "OPENROUTER_API_KEY"
+            key = os.environ.get(key_name)
             if not key:
-                raise RuntimeError(
-                    "OPENROUTER_API_KEY is not set. Copy .env.example to .env and add your key."
-                )
+                raise RuntimeError(f"{key_name} is not set. Copy .env.example to .env and add your key.")
             self._client = OpenAI(
-                base_url=OPENROUTER_URL,
+                base_url=DEEPSEEK_URL if deepseek else OPENROUTER_URL,
                 api_key=key,
                 max_retries=6,
                 timeout=120,
-                default_headers={"X-Title": "CS329Z HW1"},
+                default_headers={} if deepseek else {"X-Title": "CS329Z HW1"},
             )
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
             "max_tokens": self.max_tokens,
             # OpenRouter extensions: the reasoning effort, and the request
-            # that the response carry the cost of the call.
-            "extra_body": {"usage": {"include": True}},
+            # that the response carry the cost of the call. DeepSeek takes
+            # the effort as a plain string and reports no cost.
+            "extra_body": {} if deepseek else {"usage": {"include": True}},
         }
         if self.model not in _NO_TEMPERATURE:
             kwargs["temperature"] = self.temperature
         effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
+        effort_key = "reasoning_effort" if deepseek else "reasoning"
         if effort and self.model not in _NO_EFFORT:
-            kwargs["extra_body"]["reasoning"] = {"effort": effort}
+            kwargs["extra_body"][effort_key] = effort if deepseek else {"effort": effort}
         try:
             response = self._client.chat.completions.create(**kwargs)
         except Exception as exc:  # some models reject temperature or reasoning effort
@@ -386,9 +436,9 @@ class LM:
                 _NO_TEMPERATURE.add(self.model)
                 kwargs.pop("temperature")
                 response = self._client.chat.completions.create(**kwargs)
-            elif "reasoning" in text and "reasoning" in kwargs["extra_body"]:
+            elif "reasoning" in text and effort_key in kwargs["extra_body"]:
                 _NO_EFFORT.add(self.model)
-                kwargs["extra_body"].pop("reasoning")
+                kwargs["extra_body"].pop(effort_key)
                 response = self._client.chat.completions.create(**kwargs)
             else:
                 raise
